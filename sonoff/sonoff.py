@@ -1,9 +1,20 @@
-# The domain of your component. Should be equal to the name of your component.
-import logging, time, hmac, hashlib, random, base64, json, socket, requests, re
+import base64
+import hashlib
+import hmac
+import json
+import logging
+import os
+import random
+import re
+import socket
+import time
+import uuid
 from datetime import timedelta
 
-SCAN_INTERVAL = timedelta(seconds=60)
+import requests
+from websocket import create_connection
 
+SCAN_INTERVAL = timedelta(seconds=60)
 _LOGGER = logging.getLogger(__name__)
 
 def gen_nonce(length=8):
@@ -14,18 +25,20 @@ class Sonoff():
     # def __init__(self, hass, email, password, api_region, grace_period):
     def __init__(self, username, password, api_region, user_apikey=None, bearer_token=None, grace_period=600):
 
-        self._username      = username
-        self._password      = password
-        self._api_region    = api_region
-        self._wshost        = None
+        self._username = username
+        self._password = password
+        self._api_region = api_region
+        self._wshost = None
 
         self._skipped_login = 0
-        self._grace_period  = timedelta(seconds=grace_period)
+        self._grace_period = timedelta(seconds=grace_period)
 
-        self._user_apikey   = user_apikey
-        self._bearer_token  = bearer_token
-        self._devices       = []
-        self._ws            = None
+        self._user_apikey = user_apikey
+        self._bearer_token = bearer_token
+        self._devices = []
+        self._ws = None
+        self.api_domain = f'https://{self._api_region}-api.coolkit.cc:8080'
+        self.dispatch_domain = f'https://{self._api_region}-disp.coolkit.cc:8080'
 
         if user_apikey and bearer_token:
             self.do_reconnect()
@@ -34,8 +47,8 @@ class Sonoff():
 
     def do_reconnect(self):
         self._headers = {
-            'Authorization' : 'Bearer ' + self._bearer_token,
-            'Content-Type'  : 'application/json;charset=UTF-8'
+            'Authorization': 'Bearer ' + self._bearer_token,
+            'Content-Type': 'application/json;charset=UTF-8'
         }
 
         try:
@@ -48,20 +61,19 @@ class Sonoff():
             do_login()
 
     def do_login(self):
-        import uuid
 
         # reset the grace period
         self._skipped_login = 0
         
         app_details = {
-            'password'  : self._password,
-            'version'   : '6',
-            'ts'        : int(time.time()),
-            'nonce'     : gen_nonce(15),
-            'appid'     : 'oeVkj2lYFGnJu5XUtWisfW4utiN4u9Mq',
-            'imei'      : str(uuid.uuid4()),
-            'os'        : 'iOS',
-            'model'     : 'iPhone10,6',
+            'password': self._password,
+            'version': '6',
+            'ts': int(time.time()),
+            'nonce': gen_nonce(15),
+            'appid': 'oeVkj2lYFGnJu5XUtWisfW4utiN4u9Mq',
+            'imei': str(uuid.uuid4()),
+            'os': 'iOS',
+            'model': 'iPhone10,6',
             'romVersion': '11.1.2',
             'appVersion': '3.5.3'
         }
@@ -73,28 +85,25 @@ class Sonoff():
 
         decryptedAppSecret = b'6Nz4n0xA8s8qdxQf2GqurZj2Fs55FUvM'
 
-        hex_dig = hmac.new(
-            decryptedAppSecret, 
-            str.encode(json.dumps(app_details)), 
-            digestmod=hashlib.sha256).digest()
+        hex_dig = hmac.new(decryptedAppSecret, str.encode(json.dumps(app_details)), digestmod=hashlib.sha256).digest()
         
         sign = base64.b64encode(hex_dig).decode()
 
         self._headers = {
-            'Authorization' : 'Sign ' + sign,
-            'Content-Type'  : 'application/json;charset=UTF-8'
+            'Authorization': 'Sign ' + sign,
+            'Content-Type': 'application/json;charset=UTF-8'
         }
 
-        r = requests.post('https://{}-api.coolkit.cc:8080/api/user/login'.format(self._api_region), 
-            headers=self._headers, json=app_details)
+        r = requests.post(f'{self.api_domain}/api/user/login', headers=self._headers, json=app_details)
 
         resp = r.json()
 
         # get a new region to login
         if 'error' in resp and 'region' in resp and resp['error'] == HTTP_MOVED_PERMANENTLY:
-            self._api_region    = resp['region']
+            self._api_region = resp['region']
 
-            _LOGGER.warning("found new region: >>> %s <<< (you should change api_region option to this value in configuration.yaml)", self._api_region)
+            _LOGGER.warning("found new region: >>> %s <<< (you should change api_region option to this " \
+                            "value)", self._api_region)
 
             # re-login using the new localized endpoint
             self.do_login()
@@ -103,17 +112,15 @@ class Sonoff():
         elif 'error' in resp and resp['error'] in [HTTP_NOT_FOUND, HTTP_BAD_REQUEST]:
             # (most likely) login with +86... phone number and region != cn
             if '@' not in self._username and self._api_region != 'cn':
-                self._api_region    = 'cn'
+                self._api_region = 'cn'
                 self.do_login()
-
             else:
                 _LOGGER.error("Couldn't authenticate using the provided credentials!")
-
             return
 
-        self._bearer_token  = resp['at']
-        self._user_apikey   = resp['user']['apikey']
-        self._headers.update({'Authorization' : 'Bearer ' + self._bearer_token})
+        self._bearer_token = resp['at']
+        self._user_apikey = resp['user']['apikey']
+        self._headers.update({'Authorization': 'Bearer ' + self._bearer_token})
 
         # get the websocket host
         if not self._wshost:
@@ -122,7 +129,7 @@ class Sonoff():
         self.update_devices() # to get the devices list 
 
     def set_wshost(self):
-        r = requests.post('https://%s-disp.coolkit.cc:8080/dispatch/app' % self._api_region, headers=self._headers)
+        r = requests.post(f'{self.dispatch_domain}/dispatch/app', headers=self._headers)
         resp = r.json()
 
         if 'error' in resp and resp['error'] == 0 and 'domain' in resp:
@@ -151,10 +158,9 @@ class Sonoff():
             _LOGGER.info("Grace period active")            
             return self._devices
 
-        r = requests.get('https://{}-api.coolkit.cc:8080/api/user/device'.format(self._api_region), 
-            headers=self._headers)
-
+        r = requests.get(f'{self.api_domain}/api/user/device'.format(self._api_region), headers=self._headers)
         resp = r.json()
+
         if 'error' in resp and resp['error'] in [HTTP_BAD_REQUEST, HTTP_UNAUTHORIZED]:
             # @IMPROVE add maybe a service call / switch to deactivate sonoff component
             if self.is_grace_period():
@@ -170,7 +176,7 @@ class Sonoff():
         self._devices = r.json()
         return self._devices
 
-    def get_devices(self, force_update = False):
+    def get_devices(self, force_update=False):
         if force_update: 
             return self.update_devices()
 
@@ -192,28 +198,23 @@ class Sonoff():
 
     def _get_ws(self):
         """Check if the websocket is setup and connected."""
-        try:
-            create_connection
-        except:
-            from websocket import create_connection
-
         if self._ws is None:
             try:
                 self._ws = create_connection(('wss://{}:8080/api/ws'.format(self._wshost)), timeout=10)
 
                 payload = {
-                    'action'    : "userOnline",
-                    'userAgent' : 'app',
-                    'version'   : 6,
-                    'nonce'     : gen_nonce(15),
+                    'action': "userOnline",
+                    'userAgent': 'app',
+                    'version': 6,
+                    'nonce': gen_nonce(15),
                     'apkVesrion': "1.8",
-                    'os'        : 'ios',
-                    'at'        : self.get_bearer_token(),
-                    'apikey'    : self.get_user_apikey(),
-                    'ts'        : str(int(time.time())),
-                    'model'     : 'iPhone10,6',
+                    'os': 'ios',
+                    'at': self.get_bearer_token(),
+                    'apikey': self.get_user_apikey(),
+                    'ts': str(int(time.time())),
+                    'model': 'iPhone10,6',
                     'romVersion': '11.1.2',
-                    'sequence'  : str(time.time()).replace('.','')
+                    'sequence': str(time.time()).replace('.','')
                 }
 
                 self._ws.send(json.dumps(payload))
@@ -272,14 +273,14 @@ class Sonoff():
             params = { 'switch' : new_state }
 
         payload = {
-            'action'        : 'update',
-            'userAgent'     : 'app',
-            'params'        : params,
-            'apikey'        : device['apikey'],
-            'deviceid'      : str(deviceid),
-            'sequence'      : str(time.time()).replace('.',''),
-            'controlType'   : device['params']['controlType'] if 'controlType' in device['params'] else 4,
-            'ts'            : 0
+            'action': 'update',
+            'userAgent': 'app',
+            'params': params,
+            'apikey': device['apikey'],
+            'deviceid': str(deviceid),
+            'sequence': str(time.time()).replace('.',''),
+            'controlType': device['params']['controlType'] if 'controlType' in device['params'] else 4,
+            'ts': 0
         }
 
         # this key is needed for a shared device
@@ -306,4 +307,3 @@ class Sonoff():
         # only IF MAIN STATUS is done over websocket exclusively
 
         return new_state
-
